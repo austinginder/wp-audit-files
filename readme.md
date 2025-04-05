@@ -36,7 +36,7 @@ WP-CLI will handle downloading the package and making the `wp audit-files` comma
 
 ## Configuration
 
-You need to provide your Google Gemini API key in one of two ways:
+You need to provide your [Google Gemini API key](https://aistudio.google.com/app/apikey) in one of two ways:
 
 1. Environment Variable (Recommended): Set the `GEMINI_API_KEY` environment variable before running the command. 
     
