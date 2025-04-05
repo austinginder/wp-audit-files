@@ -1,0 +1,21 @@
+{
+    "name": "austinginder/wp-audit-files",
+    "description": "WP-CLI command to audit theme/plugin PHP files using the Google Gemini API.",
+    "type": "wp-cli-package",
+    "homepage": "https://github.com/austinginder/wp-audit-files",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Austin Ginder",
+            "homepage": "https://austinginder.com"
+        }
+    ],
+    "require": {
+        "php": ">=7.4"
+    },
+    "autoload": {
+        "files": [ "command.php" ]
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
