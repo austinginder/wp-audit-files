@@ -42,7 +42,7 @@ class Audit_Files_Command extends WP_CLI_Command {
     private $timeout;
     private $api_prompt;
     private $responseSchema;
-
+    private $custom_prompt;
 
     /**
      * Audits theme and plugin PHP files using Google Gemini.
@@ -72,6 +72,9 @@ class Audit_Files_Command extends WP_CLI_Command {
      * : Comma-separated list of plugin slugs (directory names) to include.
      *   If provided, only these plugins (and any specified themes) will be scanned.
      *
+     * [--custom-prompt=<prompt>]
+     * : Custom prompt to use for the API analysis. Replaces the default prompt.
+     *
      * ## EXAMPLES
      *
      *     # Scan ALL themes/plugins, chunk payloads, call API, display table
@@ -83,6 +86,9 @@ class Audit_Files_Command extends WP_CLI_Command {
      *     # Scan specific themes/plugins ONLY, chunk, call API
      *     wp audit-files --themes=twentytwentyfour --plugins=akismet --api-key=YOUR_KEY
      *
+     *     # Scan with a custom prompt
+     *     wp audit-files --api-key=YOUR_KEY --custom-prompt="Focus only on SQL injection vulnerabilities in the following files:"
+     *
      * @when after_wp_load
      */
     public function __invoke( $args, $assoc_args ) {
@@ -90,6 +96,7 @@ class Audit_Files_Command extends WP_CLI_Command {
         $skip_api_call = WP_CLI\Utils\get_flag_value( $assoc_args, 'skip-api-call', false );
         $this->api_key = WP_CLI\Utils\get_flag_value( $assoc_args, 'api-key', null );
         $this->timeout = WP_CLI\Utils\get_flag_value( $assoc_args, 'timeout', 300 );
+        $this->custom_prompt = WP_CLI\Utils\get_flag_value( $assoc_args, 'custom-prompt', null );
         $selected_themes_str = WP_CLI\Utils\get_flag_value( $assoc_args, 'themes', '' );
         $selected_plugins_str = WP_CLI\Utils\get_flag_value( $assoc_args, 'plugins', '' );
 
@@ -254,16 +261,28 @@ class Audit_Files_Command extends WP_CLI_Command {
             ]
         ];
 
+        // Set the default prompt
         $this->api_prompt = <<<PROMPT
 Review the following WordPress theme and plugin PHP files provided in the payload.
-Identify potential major issues such as malware patterns, significant security vulnerabilities (like SQL injection, XSS, insecure file handling), or deprecated code usage with security implications. 
+Identify potential major issues such as malware patterns, significant security vulnerabilities (like SQL injection, XSS, insecure file handling), or deprecated code usage with security implications.
 If no major issues are identified, then skip without any response.
 
 Begin payload here:
 
 PROMPT;
-    }
 
+        // Check if a custom prompt was provided
+        if ( ! is_null( $this->custom_prompt ) && is_string( $this->custom_prompt ) && ! empty( trim( $this->custom_prompt ) ) ) {
+            WP_CLI::log( "Using custom prompt provided via --custom-prompt." );
+            // Use the custom prompt with the required structure
+            $this->api_prompt = <<<PROMPT
+{$this->custom_prompt}
+
+Begin payload here:
+
+PROMPT;
+        }
+    }
 
     /**
      * Processes a single payload chunk via the Gemini API.
@@ -301,7 +320,7 @@ PROMPT;
         // --- Attempt 1: Primary Model ---
         $current_model = self::PRIMARY_MODEL;
         $api_url = "https://generativelanguage.googleapis.com/v1beta/models/{$current_model}:generateContent?key=" . $this->api_key;
- 
+
         WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Sending request to {$api_url} (timeout: {$this->timeout}s)..." );
         $response = wp_remote_post( $api_url, $request_args );
 
@@ -325,7 +344,7 @@ PROMPT;
             $current_model = self::FALLBACK_MODEL; // Update model for logging/URL
             $api_url = "https://generativelanguage.googleapis.com/v1beta/models/{$current_model}:generateContent?key=" . $this->api_key;
 
-            sleep(1);
+            sleep(1); // Short delay before retry
 
             WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Attempting fallback model ({$current_model}) via {$api_url} (timeout: {$this->timeout}s)..." );
             $response = wp_remote_post( $api_url, $request_args ); // Re-use $request_args
@@ -394,7 +413,6 @@ PROMPT;
         return $chunk_issues_array;
     }
 
-
     /**
      * Determines the absolute paths to scan based on flags.
      * (No changes needed from previous version)
@@ -455,7 +473,6 @@ PROMPT;
         }
         return $paths_to_scan;
     }
-
 
     /**
      * Finds all .php files recursively within specified directories.
