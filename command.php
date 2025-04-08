@@ -371,9 +371,8 @@ PROMPT;
             // Fallback succeeded! Log it. Processing continues below.
             WP_CLI::log( "Chunk {$chunk_num}/{$chunk_count}: Fallback model ({$current_model}) request successful." );
 
-        }
-
-        if ( $response_code < 200 || $response_code >= 300 ) {
+        } elseif ( $response_code < 200 || $response_code >= 300 ) {
+             // Handle non-429 errors from the primary model
              WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: API request returned non-success status code: " . $response_code . ". Skipping." );
              WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Raw API Response Body:\n" . $response_body );
              return false;
@@ -389,11 +388,60 @@ PROMPT;
 
         // Extract the nested JSON *string*
         $issues_json_string = $api_response_data['candidates'][0]['content']['parts'][0]['text'] ?? null;
+
+        // Check for safety ratings block or missing text part
         if ( $issues_json_string === null ) {
+             if (isset($api_response_data['candidates'][0]['finishReason']) && $api_response_data['candidates'][0]['finishReason'] === 'SAFETY') {
+                 WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: API response blocked due to safety settings. Skipping." );
+                 WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Decoded API Response Structure:\n" . print_r( $api_response_data, true ) );
+                 return false;
+             }
+             // Handle cases where 'text' might be missing for other reasons (e.g., API error structure)
              WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: Could not find the expected result text in the API response structure. Skipping." );
              WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Decoded API Response Structure:\n" . print_r( $api_response_data, true ) );
              return false;
         }
+
+        // --- Start: Clean the extracted string ---
+        $original_for_debug = $issues_json_string; // Keep original for debug
+
+        // Find the first opening bracket ([ or {)
+        $first_bracket = strpos( $issues_json_string, '[' );
+        $first_curly = strpos( $issues_json_string, '{' );
+        $start_pos = false;
+
+        if ( $first_bracket !== false && $first_curly !== false ) {
+            $start_pos = min( $first_bracket, $first_curly );
+        } elseif ( $first_bracket !== false ) {
+            $start_pos = $first_bracket;
+        } elseif ( $first_curly !== false ) {
+            $start_pos = $first_curly;
+        }
+
+        // Find the last closing bracket (] or })
+        $last_bracket = strrpos( $issues_json_string, ']' );
+        $last_curly = strrpos( $issues_json_string, '}' );
+        $end_pos = false;
+
+        if ( $last_bracket !== false && $last_curly !== false ) {
+            $end_pos = max( $last_bracket, $last_curly );
+        } elseif ( $last_bracket !== false ) {
+            $end_pos = $last_bracket;
+        } elseif ( $last_curly !== false ) {
+            $end_pos = $last_curly;
+        }
+
+        if ( $start_pos !== false && $end_pos !== false && $end_pos >= $start_pos ) {
+            // Extract the substring from the first opening bracket to the last closing bracket
+            $issues_json_string = substr( $issues_json_string, $start_pos, $end_pos - $start_pos + 1 );
+            WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Extracted potential JSON between first bracket (pos {$start_pos}) and last bracket (pos {$end_pos})." );
+        } else {
+            // If we couldn't find a valid start/end bracket pair
+            WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: Could not reliably locate JSON start/end brackets in the API response. Skipping." );
+            WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Original text content received:\n" . $original_for_debug );
+            return false;
+        }
+        // --- End: Clean the extracted string ---
 
         // Decode the actual issues list
         $chunk_issues_array = json_decode( $issues_json_string, true );
@@ -534,31 +582,37 @@ PROMPT;
                 WP_CLI::warning( "Could not read file: " . $file_path . ". Skipping." );
                 continue;
             }
-            $content = str_replace( "\0", '', $content );
+            $content = str_replace( "\0", '', $content ); // Remove null bytes
             $content_len = strlen( $content );
 
+            // Calculate size added by this file (including separator if needed)
             $added_size = ($current_chunk_size > 0 ? $file_separator_len : 0) + $file_header_len + $content_len;
 
+            // Check if the file *itself* is too large
             if ( $file_header_len + $content_len > self::MAX_PAYLOAD_CHUNK_SIZE ) {
                  WP_CLI::warning( "File wp-content{$relative_path} (size: " . size_format($content_len) . ") exceeds the maximum chunk size limit (" . size_format(self::MAX_PAYLOAD_CHUNK_SIZE) . ") and will be skipped." );
                  continue;
             }
 
+            // Check if adding this file exceeds the chunk limit
             if ( $current_chunk_size > 0 && ($current_chunk_size + $added_size) > self::MAX_PAYLOAD_CHUNK_SIZE ) {
+                // Finalize the current chunk
                 $chunks[] = $current_chunk;
                 WP_CLI::debug( "Chunk created, size: " . size_format($current_chunk_size) );
-                $current_chunk = '';
-                $current_chunk_size = 0;
-                $added_size = $file_header_len + $content_len;
+                // Start a new chunk with the current file
+                $current_chunk = $file_header . $content;
+                $current_chunk_size = $file_header_len + $content_len; // Reset size for the new chunk
+            } else {
+                // Add to the current chunk
+                if ( $current_chunk_size > 0 ) {
+                    $current_chunk .= $file_separator;
+                }
+                $current_chunk .= $file_header . $content;
+                $current_chunk_size += $added_size; // Update size correctly
             }
-
-            if ( $current_chunk_size > 0 ) {
-                $current_chunk .= $file_separator;
-            }
-            $current_chunk .= $file_header . $content;
-            $current_chunk_size += $added_size;
         }
 
+        // Add the last remaining chunk if it has content
         if ( $current_chunk_size > 0 ) {
             $chunks[] = $current_chunk;
              WP_CLI::debug( "Final chunk created, size: " . size_format($current_chunk_size) );
