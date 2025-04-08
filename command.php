@@ -463,14 +463,12 @@ PROMPT;
 
     /**
      * Determines the absolute paths to scan based on flags.
-     * (No changes needed from previous version)
      *
      * @param string $selected_themes_str Comma-separated theme slugs.
      * @param string $selected_plugins_str Comma-separated plugin slugs.
      * @return array List of absolute directory paths to scan.
      */
     private function determine_scan_paths( $selected_themes_str, $selected_plugins_str ) {
-        // ... (implementation remains the same) ...
         $paths_to_scan = [];
         $scan_only_selected = ! empty( $selected_themes_str ) || ! empty( $selected_plugins_str );
 
@@ -524,13 +522,11 @@ PROMPT;
 
     /**
      * Finds all .php files recursively within specified directories.
-     * (No changes needed from original)
      *
      * @param array $paths_to_scan List of absolute directory paths to scan.
      * @return array List of full file paths.
      */
     private function find_php_files( $paths_to_scan ) {
-        // ... (implementation remains the same) ...
         $files = [];
         foreach ( $paths_to_scan as $path ) {
             if ( ! is_dir( $path ) ) continue;
@@ -555,13 +551,11 @@ PROMPT;
 
     /**
      * Generates payload content chunks from a list of files, respecting size limits.
-     * (No changes needed from previous version)
      *
      * @param array $files List of file paths.
      * @return array An array of strings, each representing a payload chunk.
      */
     private function generate_payload_chunks( $files ) {
-        // ... (implementation remains the same) ...
         $chunks = [];
         $current_chunk = '';
         $current_chunk_size = 0;
