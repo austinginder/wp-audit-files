@@ -23,13 +23,7 @@ service and rate limits.
 Ensure you have WP-CLI installed. Then, install the package directly from GitHub:
 
 ```bash
-wp package install git@github.com:austinginder/wp-audit-files.git
-```
-
-Or using HTTPS:
-
-```bash
-wp package install https://github.com/austinginder/wp-audit-files.git
+wp package install austinginder/wp-audit-files
 ```
 
 WP-CLI will handle downloading the package and making the `wp audit-files` command available.
