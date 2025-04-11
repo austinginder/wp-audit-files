@@ -43,6 +43,7 @@ class Audit_Files_Command extends WP_CLI_Command {
     private $api_prompt;
     private $responseSchema;
     private $custom_prompt;
+    private $ignored_directories = [];
 
     /**
      * Audits theme and plugin PHP files using Google Gemini.
@@ -57,6 +58,7 @@ class Audit_Files_Command extends WP_CLI_Command {
      *
      * [--skip-api-call]
      * : Only find files and report the number of chunks, do not make API calls.
+     *   This is implicitly true if --output is used.
      *
      * [--api-key=<key>]
      * : Google Gemini API Key. If not provided, it will try to read the GEMINI_API_KEY environment variable.
@@ -75,6 +77,16 @@ class Audit_Files_Command extends WP_CLI_Command {
      * [--custom-prompt=<prompt>]
      * : Custom prompt to use for the API analysis. Replaces the default prompt.
      *
+     * [--output=<filename>]
+     * : Output the combined payload content to the specified file (e.g., payload.txt)
+     *   instead of sending it to the API. This skips the API call process.
+     *   Defaults to 'payload.txt' if the flag is provided without a value.
+     *
+     * [--ignore-directories=<dirs>]
+     * : Comma-separated list of directory paths (relative to wp-content, e.g.,
+     *   "plugins/some-plugin/vendor/,themes/my-theme/node_modules/") to exclude
+     *   from the payload.
+     *
      * ## EXAMPLES
      *
      *     # Scan ALL themes/plugins, chunk payloads, call API, display table
@@ -89,6 +101,12 @@ class Audit_Files_Command extends WP_CLI_Command {
      *     # Scan with a custom prompt
      *     wp audit-files --api-key=YOUR_KEY --custom-prompt="Focus only on SQL injection vulnerabilities in the following files:"
      *
+     *     # Scan specific plugin, ignoring its vendor directory, and output payload to file
+     *     wp audit-files --plugins=my-plugin --ignore-directories="plugins/my-plugin/vendor/" --output=my-plugin-payload.txt
+     *
+     *     # Scan all but ignore specific directories, skip API call
+     *     wp audit-files --ignore-directories="plugins/woocommerce/packages/,plugins/jetpack/_inc/lib/" --skip-api-call
+     *
      * @when after_wp_load
      */
     public function __invoke( $args, $assoc_args ) {
@@ -99,15 +117,33 @@ class Audit_Files_Command extends WP_CLI_Command {
         $this->custom_prompt = WP_CLI\Utils\get_flag_value( $assoc_args, 'custom-prompt', null );
         $selected_themes_str = WP_CLI\Utils\get_flag_value( $assoc_args, 'themes', '' );
         $selected_plugins_str = WP_CLI\Utils\get_flag_value( $assoc_args, 'plugins', '' );
+        $output_filename = WP_CLI\Utils\get_flag_value( $assoc_args, 'output', null );
+        $ignore_dirs_str = WP_CLI\Utils\get_flag_value( $assoc_args, 'ignore-directories', '' );
 
-        // --- API Key Validation ---
-        if ( ! $this->api_key ) {
-            $this->api_key = getenv( 'GEMINI_API_KEY' );
+        // If --output is used, set filename to default if none provided, and force skip API call
+        $output_payload = false;
+        if ( $output_filename !== null ) {
+            $output_payload = true;
+            if ( $output_filename === true || $output_filename === '' ) { // Handle flag without value or empty value
+                $output_filename = 'payload.txt';
+            }
+            $skip_api_call = true; // Outputting payload means we don't call the API
+            WP_CLI::log( "Payload will be written to '{$output_filename}', API calls will be skipped." );
         }
-        if ( ! $skip_api_call && ! $this->api_key ) {
-            WP_CLI::error( "API Key not provided. Please set the GEMINI_API_KEY environment variable or use the --api-key option." );
-            return;
+
+        // --- API Key Validation (only if not skipping API) ---
+        if ( ! $skip_api_call ) {
+            if ( ! $this->api_key ) {
+                $this->api_key = getenv( 'GEMINI_API_KEY' );
+            }
+            if ( ! $this->api_key ) {
+                WP_CLI::error( "API Key not provided and API call not skipped. Please set the GEMINI_API_KEY environment variable or use the --api-key option, or use --skip-api-call / --output." );
+                return;
+            }
         }
+
+        // --- Parse and Normalize Ignored Directories ---
+        $this->parse_ignored_directories( $ignore_dirs_str );
 
         // --- Determine Paths to Scan ---
         $paths_to_scan = $this->determine_scan_paths( $selected_themes_str, $selected_plugins_str );
@@ -122,22 +158,38 @@ class Audit_Files_Command extends WP_CLI_Command {
             WP_CLI::warning( "No PHP files found in the specified directories." );
             return;
         }
-        WP_CLI::log( "Found " . count( $php_files ) . " PHP files." );
+        WP_CLI::log( "Found " . count( $php_files ) . " PHP files initially." );
+        // Note: Filtering based on --ignore-directories happens during payload generation.
 
-        // --- 2. Generate Payload Chunks ---
+        // --- 2a. Handle --output: Generate Combined Payload and Save ---
+        if ( $output_payload ) {
+            WP_CLI::log( "Generating combined payload for output..." );
+            $combined_payload = $this->generate_combined_payload( $php_files );
+            $bytes_written = file_put_contents( $output_filename, $combined_payload );
+
+            if ( $bytes_written !== false ) {
+                WP_CLI::success( "Combined payload (excluding ignored directories) successfully written to: " . $output_filename . " (" . size_format( $bytes_written ) . ")" );
+            } else {
+                WP_CLI::error( "Failed to write combined payload to: " . $output_filename );
+            }
+            return; // Exit after writing payload
+        }
+
+        // --- 2b. Generate Payload Chunks (if not outputting) ---
         WP_CLI::log( "Generating payload chunks (max size per chunk: " . size_format( self::MAX_PAYLOAD_CHUNK_SIZE ) . ")..." );
         $payload_chunks = $this->generate_payload_chunks( $php_files );
         $chunk_count = count( $payload_chunks );
 
         if ( $chunk_count === 0 ) {
-             WP_CLI::warning( "No payload chunks generated. This might happen if all files were empty or could not be read, or if individual files exceed the chunk size limit." );
+             WP_CLI::warning( "No payload chunks generated. This might happen if all files were empty, ignored, could not be read, or if individual files exceed the chunk size limit." );
              return;
         }
-        WP_CLI::log( "Payload split into " . $chunk_count . " chunk(s)." );
+        WP_CLI::log( "Payload split into " . $chunk_count . " chunk(s) after filtering ignored directories." );
 
         // --- 3. Prepare for API Calls (if not skipped) ---
         if ( $skip_api_call ) {
             WP_CLI::log( "Skipping API calls as requested." );
+            // We already logged chunk count above if applicable
             return;
         }
 
@@ -210,6 +262,18 @@ class Audit_Files_Command extends WP_CLI_Command {
                 if ( ! isset( $issue['code_snippet'] ) || is_null( $issue['code_snippet'] ) ) {
                     $all_issues[$key]['code_snippet'] = '';
                 }
+                 // Ensure file_path exists
+                if ( ! isset( $issue['file_path'] ) || is_null( $issue['file_path'] ) ) {
+                    $all_issues[$key]['file_path'] = '[Unknown Path]';
+                }
+                 // Ensure severity exists
+                if ( ! isset( $issue['severity'] ) || is_null( $issue['severity'] ) ) {
+                    $all_issues[$key]['severity'] = 'Unknown';
+                }
+                 // Ensure issue_description exists
+                if ( ! isset( $issue['issue_description'] ) || is_null( $issue['issue_description'] ) ) {
+                    $all_issues[$key]['issue_description'] = '[No Description]';
+                }
             }
             WP_CLI\Utils\format_items( 'table', $all_issues, $fields );
         }
@@ -239,6 +303,67 @@ class Audit_Files_Command extends WP_CLI_Command {
             }
         }
 
+    }
+
+    /**
+     * Parses the comma-separated string of ignored directories and normalizes them.
+     *
+     * @param string $ignore_dirs_str Comma-separated directory paths relative to wp-content.
+     */
+    private function parse_ignored_directories( $ignore_dirs_str ) {
+        $this->ignored_directories = [];
+        if ( ! empty( $ignore_dirs_str ) ) {
+            $raw_ignored = array_map( 'trim', explode( ',', $ignore_dirs_str ) );
+            $count = 0;
+            foreach ( $raw_ignored as $dir ) {
+                if ( empty( $dir ) ) continue;
+                // Normalize separators to '/' for comparison
+                $normalized_dir = str_replace( '\\', '/', $dir );
+                // Remove leading/trailing slashes for consistency
+                $normalized_dir = trim( $normalized_dir, '/' );
+                // Add back leading and trailing slash for prefix matching
+                // Ensure it starts relative to wp-content (i.e., starts with themes/ or plugins/)
+                if ( ! empty( $normalized_dir ) ) {
+                    $this->ignored_directories[] = '/' . $normalized_dir . '/';
+                    $count++;
+                }
+            }
+            if ( $count > 0 ) {
+                WP_CLI::log( "Ignoring files within {$count} specified director(y/ies)." );
+                WP_CLI::debug( "Normalized ignored directories: " . implode( ', ', $this->ignored_directories ) );
+            }
+        }
+    }
+
+    /**
+     * Checks if a given file path should be ignored based on the --ignore-directories list.
+     *
+     * @param string $file_path Absolute path to the file.
+     * @return bool True if the file should be ignored, false otherwise.
+     */
+    private function is_file_ignored( $file_path ) {
+        if ( empty( $this->ignored_directories ) ) {
+            return false;
+        }
+
+        $wp_content_path_len = strlen( WP_CONTENT_DIR );
+        $relative_path = substr( $file_path, $wp_content_path_len );
+        // Normalize separators to '/'
+        $normalized_relative_path = str_replace( '\\', '/', $relative_path );
+        // Ensure leading slash
+        if ( strpos( $normalized_relative_path, '/' ) !== 0 ) {
+            $normalized_relative_path = '/' . $normalized_relative_path;
+        }
+
+        foreach ( $this->ignored_directories as $ignored_dir ) {
+            // Check if the normalized relative path starts with the normalized ignored directory
+            if ( strpos( $normalized_relative_path, $ignored_dir ) === 0 ) {
+                WP_CLI::debug( "Ignoring file due to rule '{$ignored_dir}': {$normalized_relative_path}" );
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -396,7 +521,13 @@ PROMPT;
                  WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Decoded API Response Structure:\n" . print_r( $api_response_data, true ) );
                  return false;
              }
-             // Handle cases where 'text' might be missing for other reasons (e.g., API error structure)
+             // Handle cases where 'text' might be missing for other reasons (e.g., API error structure, or maybe no issues found and API returns empty content)
+             // Check if the response indicates no content was generated intentionally
+             if (isset($api_response_data['candidates'][0]['finishReason']) && $api_response_data['candidates'][0]['finishReason'] === 'STOP' && empty($api_response_data['candidates'][0]['content'])) {
+                 WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: API indicated successful completion but no content part (likely no issues found)." );
+                 return []; // Return empty array, indicating no issues found for this chunk
+             }
+
              WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: Could not find the expected result text in the API response structure. Skipping." );
              WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Decoded API Response Structure:\n" . print_r( $api_response_data, true ) );
              return false;
@@ -436,7 +567,12 @@ PROMPT;
             $issues_json_string = substr( $issues_json_string, $start_pos, $end_pos - $start_pos + 1 );
             WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Extracted potential JSON between first bracket (pos {$start_pos}) and last bracket (pos {$end_pos})." );
         } else {
-            // If we couldn't find a valid start/end bracket pair
+            // If we couldn't find a valid start/end bracket pair, maybe the response is empty or just text
+            // Check if the original string is empty or effectively empty after trimming
+            if (trim($original_for_debug) === '') {
+                WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: API response text content was empty. Assuming no issues reported." );
+                return []; // Treat as no issues found
+            }
             WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: Could not reliably locate JSON start/end brackets in the API response. Skipping." );
             WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Original text content received:\n" . $original_for_debug );
             return false;
@@ -446,8 +582,14 @@ PROMPT;
         // Decode the actual issues list
         $chunk_issues_array = json_decode( $issues_json_string, true );
         if ( json_last_error() !== JSON_ERROR_NONE ) {
-            WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: API returned text that wasn't the expected valid JSON array: " . json_last_error_msg() . ". Skipping." );
-            WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Received text content (expected JSON string):\n" . $issues_json_string );
+            // Before failing, check if the cleaned string is just "[]" or "{}" which decodes to empty array/object
+            if (trim($issues_json_string) === '[]' || trim($issues_json_string) === '{}') {
+                 WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: API returned an empty JSON array/object. Assuming no issues reported." );
+                 return []; // Treat as no issues found
+            }
+            WP_CLI::warning( "Chunk {$chunk_num}/{$chunk_count}: API returned text that wasn't the expected valid JSON array after cleaning: " . json_last_error_msg() . ". Skipping." );
+            WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Received text content (cleaned, expected JSON string):\n" . $issues_json_string );
+            WP_CLI::debug( "Chunk {$chunk_num}/{$chunk_count}: Original text content received:\n" . $original_for_debug );
             return false;
         }
 
@@ -522,6 +664,7 @@ PROMPT;
 
     /**
      * Finds all .php files recursively within specified directories.
+     * Does NOT filter based on --ignore-directories here.
      *
      * @param array $paths_to_scan List of absolute directory paths to scan.
      * @return array List of full file paths.
@@ -532,25 +675,35 @@ PROMPT;
             if ( ! is_dir( $path ) ) continue;
             try {
                 $iterator = new RecursiveIteratorIterator(
-                    new RecursiveDirectoryIterator( $path, RecursiveDirectoryIterator::SKIP_DOTS ),
+                    new RecursiveDirectoryIterator( $path, RecursiveDirectoryIterator::SKIP_DOTS | RecursiveDirectoryIterator::FOLLOW_SYMLINKS ), // Added FOLLOW_SYMLINKS
                     RecursiveIteratorIterator::SELF_FIRST
                 );
                 foreach ( $iterator as $fileinfo ) {
+                    // Check if it's a readable file with a .php extension
                     if ( $fileinfo->isFile() && $fileinfo->isReadable() && strtolower( $fileinfo->getExtension() ) === 'php' ) {
-                        $files[] = $fileinfo->getRealPath();
+                        $real_path = $fileinfo->getRealPath();
+                        // Ensure realpath() didn't fail (e.g., broken symlink)
+                        if ($real_path !== false) {
+                            $files[] = $real_path;
+                        } else {
+                             WP_CLI::debug( "Skipping unresolvable path: " . $fileinfo->getPathname() );
+                        }
                     }
                 }
             } catch ( UnexpectedValueException $e ) {
-                WP_CLI::warning( "Could not fully access path: " . $path . " - " . $e->getMessage() );
+                // This often happens with permission errors or unreadable directories/symlinks
+                WP_CLI::warning( "Could not fully access path or encountered issue: " . $path . " - " . $e->getMessage() );
             } catch ( Exception $e ) {
                  WP_CLI::warning( "Error scanning path: " . $path . " - " . $e->getMessage() );
             }
         }
+        // Return unique paths, as symlinks might cause duplicates if not handled carefully
         return array_unique( $files );
     }
 
     /**
-     * Generates payload content chunks from a list of files, respecting size limits.
+     * Generates payload content chunks from a list of files, respecting size limits
+     * and ignoring specified directories.
      *
      * @param array $files List of file paths.
      * @return array An array of strings, each representing a payload chunk.
@@ -562,13 +715,23 @@ PROMPT;
         $wp_content_path_len = strlen( WP_CONTENT_DIR );
         $file_separator = "\n\n";
         $file_separator_len = strlen( $file_separator );
+        $included_file_count = 0;
+        $ignored_file_count = 0;
 
         foreach ( $files as $file_path ) {
-            $relative_path = substr( $file_path, $wp_content_path_len );
-            if ( strpos( $relative_path, DIRECTORY_SEPARATOR ) !== 0 ) {
-                 $relative_path = DIRECTORY_SEPARATOR . $relative_path;
+            // Check if file should be ignored BEFORE reading content
+            if ( $this->is_file_ignored( $file_path ) ) {
+                $ignored_file_count++;
+                continue;
             }
-            $file_header = "--- File: wp-content" . $relative_path . " ---\n";
+
+            $relative_path = substr( $file_path, $wp_content_path_len );
+            // Normalize separators and ensure leading slash for header
+            $normalized_relative_path = str_replace( '\\', '/', $relative_path );
+            if ( strpos( $normalized_relative_path, '/' ) !== 0 ) {
+                 $normalized_relative_path = '/' . $normalized_relative_path;
+            }
+            $file_header = "--- File: wp-content" . $normalized_relative_path . " ---\n";
             $file_header_len = strlen( $file_header );
 
             $content = file_get_contents( $file_path );
@@ -584,7 +747,7 @@ PROMPT;
 
             // Check if the file *itself* is too large
             if ( $file_header_len + $content_len > self::MAX_PAYLOAD_CHUNK_SIZE ) {
-                 WP_CLI::warning( "File wp-content{$relative_path} (size: " . size_format($content_len) . ") exceeds the maximum chunk size limit (" . size_format(self::MAX_PAYLOAD_CHUNK_SIZE) . ") and will be skipped." );
+                 WP_CLI::warning( "File wp-content{$normalized_relative_path} (size: " . size_format($content_len) . ") exceeds the maximum chunk size limit (" . size_format(self::MAX_PAYLOAD_CHUNK_SIZE) . ") and will be skipped." );
                  continue;
             }
 
@@ -596,6 +759,7 @@ PROMPT;
                 // Start a new chunk with the current file
                 $current_chunk = $file_header . $content;
                 $current_chunk_size = $file_header_len + $content_len; // Reset size for the new chunk
+                $included_file_count++;
             } else {
                 // Add to the current chunk
                 if ( $current_chunk_size > 0 ) {
@@ -603,6 +767,7 @@ PROMPT;
                 }
                 $current_chunk .= $file_header . $content;
                 $current_chunk_size += $added_size; // Update size correctly
+                $included_file_count++;
             }
         }
 
@@ -612,8 +777,68 @@ PROMPT;
              WP_CLI::debug( "Final chunk created, size: " . size_format($current_chunk_size) );
         }
 
+        if ( $ignored_file_count > 0 ) {
+            WP_CLI::log( "Ignored {$ignored_file_count} file(s) based on --ignore-directories rules." );
+        }
+        WP_CLI::log( "Included {$included_file_count} file(s) in the generated payload/chunks." );
+
+
         return $chunks;
     }
+
+     /**
+     * Generates a single combined payload string from a list of files,
+     * ignoring specified directories. Used for the --output flag.
+     *
+     * @param array $files List of file paths.
+     * @return string The combined payload content.
+     */
+    private function generate_combined_payload( $files ) {
+        $combined_payload = '';
+        $wp_content_path_len = strlen( WP_CONTENT_DIR );
+        $file_separator = "\n\n";
+        $included_file_count = 0;
+        $ignored_file_count = 0;
+
+        foreach ( $files as $file_path ) {
+            // Check if file should be ignored BEFORE reading content
+            if ( $this->is_file_ignored( $file_path ) ) {
+                $ignored_file_count++;
+                continue;
+            }
+
+            $relative_path = substr( $file_path, $wp_content_path_len );
+            // Normalize separators and ensure leading slash for header
+            $normalized_relative_path = str_replace( '\\', '/', $relative_path );
+            if ( strpos( $normalized_relative_path, '/' ) !== 0 ) {
+                 $normalized_relative_path = '/' . $normalized_relative_path;
+            }
+            $file_header = "--- File: wp-content" . $normalized_relative_path . " ---\n";
+
+            $content = file_get_contents( $file_path );
+            if ( $content === false ) {
+                WP_CLI::warning( "Could not read file: " . $file_path . ". Skipping." );
+                continue;
+            }
+            $content = str_replace( "\0", '', $content ); // Remove null bytes
+
+            // Add separator if not the first file
+            if ( ! empty( $combined_payload ) ) {
+                $combined_payload .= $file_separator;
+            }
+
+            $combined_payload .= $file_header . $content;
+            $included_file_count++;
+        }
+
+        if ( $ignored_file_count > 0 ) {
+            WP_CLI::log( "Ignored {$ignored_file_count} file(s) based on --ignore-directories rules." );
+        }
+        WP_CLI::log( "Included {$included_file_count} file(s) in the combined payload." );
+
+        return $combined_payload;
+    }
+
 
     /**
      * Sorts the issues array by severity.
@@ -621,15 +846,24 @@ PROMPT;
      * @param array &$issues_array The array of issues to sort (passed by reference).
      */
     private function sort_issues( &$issues_array ) {
-         $severity_order = [ 'high' => 1, 'medium' => 2, 'low' => 3, 'info' => 4 ];
-         $default_priority = 5;
+         $severity_order = [ 'high' => 1, 'medium' => 2, 'low' => 3, 'info' => 4, 'unknown' => 5 ]; // Added unknown
+         $default_priority = 6; // Default for completely missing severity
 
          usort( $issues_array, function( $a, $b ) use ( $severity_order, $default_priority ) {
              $sev_a = strtolower( $a['severity'] ?? '' );
              $sev_b = strtolower( $b['severity'] ?? '' );
              $priority_a = $severity_order[ $sev_a ] ?? $default_priority;
              $priority_b = $severity_order[ $sev_b ] ?? $default_priority;
-             return $priority_a <=> $priority_b;
+
+             // Primary sort by severity
+             if ($priority_a !== $priority_b) {
+                 return $priority_a <=> $priority_b;
+             }
+
+             // Secondary sort by file path if severity is the same
+             $path_a = $a['file_path'] ?? '';
+             $path_b = $b['file_path'] ?? '';
+             return strcmp($path_a, $path_b);
          } );
     }
 }
