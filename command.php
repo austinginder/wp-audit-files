@@ -29,7 +29,7 @@ class Audit_Files_Command extends WP_CLI_Command {
     /**
      * Primary Gemini model to use for analysis.
      */
-    private const PRIMARY_MODEL = 'gemini-2.5-pro-exp-03-25'; // Your preferred Pro model
+    private const PRIMARY_MODEL = 'gemini-2.5-pro'; // Your preferred Pro model
 
     /**
      * Fallback Gemini model to use if the primary model hits quota limits (429).
